@@ -328,8 +328,7 @@
       update();
       const total = r.trusses.reduce((s, t) => s + t.count, 0);
       const perTruss = r.trusses.map((t) => t.count).join(" / ");
-      const lead = !r.reached ? `Can't reach ${target} lx with these trusses at ${scene.minSpacing} m spacing. `
-        : r.added === 0 ? "The locked fixtures already reach the target. " : "";
+      const lead = r.reached ? "" : `Can't reach ${target} lx with these trusses at ${scene.minSpacing} m spacing. `;
       out.textContent = lead +
         `${total} fixtures (${perTruss}) · avg ${Math.round(r.stats.mean)} lx · min ${Math.round(r.stats.min)} lx`;
       btn.disabled = false;

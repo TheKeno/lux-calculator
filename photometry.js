@@ -198,101 +198,151 @@
     return samples;
   }
 
-  // Average and lowest lux over the rig area (see rigSamples).
+  // Average, lowest and relative spread (cv = std/mean) of lux over the rig area (see rigSamples).
   function rigStats(scene, library) {
     const placed = placeFixtures(scene, library);
     const samples = rigSamples(scene);
-    if (!samples.length) return { mean: 0, min: 0, u0: 0 };
-    let sum = 0, min = Infinity;
-    for (const p of samples) { const e = illuminanceAt(placed, p); sum += e; if (e < min) min = e; }
-    const mean = sum / samples.length;
-    return { mean, min, u0: mean > 0 ? min / mean : 0 };
+    if (!samples.length) return { mean: 0, min: 0, u0: 0, cv: 0 };
+    const values = samples.map((p) => illuminanceAt(placed, p));
+    const mean = values.reduce((sum, e) => sum + e, 0) / values.length;
+    const min = Math.min(...values);
+    const sd = Math.sqrt(values.reduce((sum, e) => sum + (e - mean) ** 2, 0) / values.length);
+    return { mean, min, u0: mean > 0 ? min / mean : 0, cv: mean > 0 ? sd / mean : 0 };
   }
 
   // Decides how many fixtures each truss needs, and where, for an average of `target` lux over
-  // the rig area. Trusses, fixture types, dimmers and locked fixtures are kept; unlocked fixtures
-  // are removed and rebuilt. Fixtures are added one at a time to whichever truss gives the most
-  // even light after optimiseCoverage re-arranges them (symmetric, respecting minSpacing), until
-  // the average reaches the target or every truss is full at the minimum spacing. Adding one at a
-  // time can leave the trusses lopsided, so a final pass tries moving single unlocked fixtures
-  // between trusses (same total) and keeps any move that evens the light and still meets target.
+  // the rig area, starting from empty trusses. Trusses, fixture types and dimmers are kept; every
+  // fixture, locked or not, is removed and the new ones come out unlocked.
+  //
+  // It searches whole layouts rather than adding fixtures one by one (which piles fixtures onto
+  // whichever truss wins the first few, nearly meaningless, steps):
+  //   1. Find the fewest fixtures that reach the target, by halving the range with balanced
+  //      layouts (the average depends mostly on the count, not on which truss carries them).
+  //   2. Share that total over the trusses in proportion to their length.
+  //   3. Hill-climb: try moving one fixture from each truss to each other truss, arrange every
+  //      option with optimiseCoverage (symmetric, respecting minSpacing), and keep the move that
+  //      makes the light most even, until none helps.
+  //   4. Too dark: add a fixture where it helps most and climb again. Once the target is met,
+  //      check whether one fixture fewer (climbed the same way) still meets it.
+  // Evenness uses the same score as optimiseCoverage: coefficient of variation minus half min/avg.
   //
   // Returns { trusses: [{ count, positions, locks }], stats: {mean, min, u0}, reached, added }.
   function designForTarget(scene, library, target) {
-    const sc = { ...scene, trusses: scene.trusses.map((t) => {
-      const pos = fixturePositions(t), locks = fixtureLocks(t);
-      const keep = pos.map((p, i) => i).filter((i) => locks[i]);
-      return { ...t, count: keep.length, positions: keep.map((i) => pos[i]), locks: keep.map(() => true) };
-    }) };
     const spacing = Math.max(0, scene.minSpacing ?? 0);
-    const capacity = (t) => (spacing > 0 ? Math.floor(t.length / spacing + 1e-9) + 1 : 50);
-    const usable = (t) => library.some((f) => f.id === t.fixtureId);
+    const usable = scene.trusses.map((t) => t.length > 0 && library.some((f) => f.id === t.fixtureId));
+    const capacity = scene.trusses.map((t, i) =>
+      (usable[i] ? (spacing > 0 ? Math.floor(t.length / spacing + 1e-9) + 1 : 50) : 0));
+    const maxTotal = capacity.reduce((a, b) => a + b, 0);
+    const empty = { trusses: scene.trusses.map(() => ({ count: 0, positions: [], locks: [] })), stats: { mean: 0, min: 0, u0: 0 }, reached: target <= 0, added: 0 };
+    if (!maxTotal) return empty;
 
-    // A copy of sc with truss ti changed by delta unlocked fixtures, re-arranged by optimiseCoverage.
-    const withCount = (base, changes) => {
-      const trial = { ...base, trusses: base.trusses.map((u, j) => {
-        const delta = changes[j] || 0;
-        if (!delta) return u;
-        let pos = fixturePositions(u), locks = fixtureLocks(u);
-        if (delta > 0) {
-          pos = [...pos, ...Array(delta).fill(u.length / 2)];
-          locks = [...locks, ...Array(delta).fill(false)];
-        } else {
-          for (let r = -delta; r > 0; r--) {
-            const k = locks.lastIndexOf(false);
-            if (k < 0) return null;
-            pos = pos.filter((_, i) => i !== k); locks = locks.filter((_, i) => i !== k);
-          }
-        }
-        return { ...u, count: pos.length, positions: pos, locks };
-      }) };
-      if (trial.trusses.some((u) => u === null)) return null;
-      const r = optimiseCoverage(trial, library);
-      if (r) trial.trusses = trial.trusses.map((u, j) => ({ ...u, positions: r.positions[j] }));
-      return { scene: trial, stats: rigStats(trial, library) };
+    const BALANCE_WEIGHT = 0.1;
+    const shareWeights = scene.trusses.map((t, i) => (usable[i] ? t.length : 0));
+    const shareSum = shareWeights.reduce((a, b) => a + b, 0);
+    const total = (counts) => counts.reduce((a, b) => a + b, 0);
+
+    // Evaluate a count per truss: fixtures spread evenly, then arranged by optimiseCoverage.
+    const cache = new Map();
+    const evaluate = (counts) => {
+      const key = counts.join(",");
+      if (cache.has(key)) return cache.get(key);
+      const trial = { ...scene, trusses: scene.trusses.map((t, i) => ({
+        ...t, count: counts[i], positions: evenPositions(t.length, counts[i]), locks: Array(counts[i]).fill(false),
+      })) };
+      const r = counts.some((c) => c > 0) ? optimiseCoverage(trial, library, { quick: true }) : null;
+      if (r) trial.trusses = trial.trusses.map((t, i) => ({ ...t, positions: r.positions[i] }));
+      const st = rigStats(trial, library);
+      // Mild preference for each truss carrying its length-proportional share: without it, high
+      // targets cram fixtures at the outer trusses' ends to chase the last bit of evenness.
+      const n = total(counts) || 1;
+      const imbalance = counts.reduce((sum, c, i) => sum + Math.abs(c - (n * shareWeights[i]) / shareSum), 0) / n;
+      const cost = st.mean > 0 ? st.cv - 0.5 * st.u0 + BALANCE_WEIGHT * imbalance : Infinity;
+      const out = { counts, trusses: trial.trusses, stats: st, cost };
+      cache.set(key, out);
+      return out;
     };
 
-    let stats = rigStats(sc, library);
-    let added = 0;
-    while (stats.mean < target) {
-      let best = null;
-      sc.trusses.forEach((t, ti) => {
-        if (!usable(t) || t.count >= capacity(t)) return;
-        const cand = withCount(sc, { [ti]: 1 });
-        // Most even light wins; a clearly higher average breaks ties.
-        if (cand && (!best || cand.stats.u0 > best.stats.u0 + 1e-6 ||
-            (Math.abs(cand.stats.u0 - best.stats.u0) <= 1e-6 && cand.stats.mean > best.stats.mean))) {
-          best = cand;
-        }
-      });
-      if (!best) break;
-      sc.trusses = best.scene.trusses;
-      stats = best.stats;
-      added++;
-    }
+    // Split n fixtures over the usable trusses in proportion to length (largest remainder), capped.
+    const proportional = (n) => {
+      const share = (w) => (n * w) / shareSum;
+      const counts = shareWeights.map((w, i) => Math.min(capacity[i], Math.floor(share(w))));
+      const order = shareWeights.map((w, i) => [share(w) - Math.floor(share(w)), i]).sort((a, b) => b[0] - a[0]);
+      while (total(counts) < n) {
+        const next = order.find(([, i]) => counts[i] < capacity[i]);
+        if (!next) break;
+        counts[next[1]]++;
+        order.push(order.splice(order.indexOf(next), 1)[0]); // round-robin the leftovers
+      }
+      return counts;
+    };
 
-    // Rebalance: move one unlocked fixture from truss a to truss b while that evens the light out.
-    for (let round = 0, improved = true; improved && round < 20; round++) {
-      improved = false;
-      for (let a = 0; a < sc.trusses.length && !improved; a++) {
-        if (!fixtureLocks(sc.trusses[a]).includes(false)) continue;
-        for (let b = 0; b < sc.trusses.length && !improved; b++) {
-          const tb = sc.trusses[b];
-          if (a === b || !usable(tb) || tb.count >= capacity(tb)) continue;
-          const cand = withCount(sc, { [a]: -1, [b]: 1 });
-          if (cand && cand.stats.mean >= Math.min(target, stats.mean) && cand.stats.u0 > stats.u0 + 1e-3) {
-            sc.trusses = cand.scene.trusses;
-            stats = cand.stats;
-            improved = true;
+    // Steepest-descent over "move one fixture from truss a to truss b".
+    const climb = (counts) => {
+      let best = evaluate(counts);
+      for (let round = 0; round < 50; round++) {
+        let next = null;
+        for (let a = 0; a < counts.length; a++) {
+          if (!best.counts[a]) continue;
+          for (let b = 0; b < counts.length; b++) {
+            if (a === b || !usable[b] || best.counts[b] >= capacity[b]) continue;
+            const c = best.counts.slice(); c[a]--; c[b]++;
+            const cand = evaluate(c);
+            if (cand.cost < (next ? next.cost : best.cost) - 1e-4) next = cand;
           }
         }
+        if (!next) break;
+        best = next;
+      }
+      return best;
+    };
+
+    // The best climbed layout with one more fixture than `from`.
+    const addOne = (from) => {
+      let best = null;
+      from.counts.forEach((c, i) => {
+        if (!usable[i] || c >= capacity[i]) return;
+        const counts = from.counts.slice(); counts[i]++;
+        const cand = evaluate(counts);
+        if (!best || cand.cost < best.cost) best = cand;
+      });
+      return best ? climb(best.counts) : null;
+    };
+
+    // 1. The total: the average depends mostly on how many fixtures there are, not which truss
+    //    carries them, so halve the range with balanced layouts to find the fewest that reach it.
+    let lo = 1, hi = maxTotal;
+    if (evaluate(proportional(hi)).stats.mean >= target) {
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (evaluate(proportional(mid)).stats.mean >= target) hi = mid; else lo = mid + 1;
       }
     }
+    const n = hi;
+
+    // 2-3. Balanced start, then climb.
+    let best = climb(proportional(n));
+
+    // 4. Rebalancing can shift the average a little: top up, or drop one, if needed.
+    while (best.stats.mean < target && total(best.counts) < maxTotal) {
+      const more = addOne(best);
+      if (!more) break;
+      best = more;
+    }
+    if (total(best.counts) > 1) {
+      const fewer = climb(proportional(total(best.counts) - 1));
+      if (fewer.stats.mean >= target) best = fewer;
+    }
+
+    // Candidates were arranged with the quick search; give the winner the full one.
+    const final = { ...scene, trusses: best.trusses };
+    const polished = optimiseCoverage(final, library);
+    if (polished) final.trusses = final.trusses.map((t, i) => ({ ...t, positions: polished.positions[i] }));
+    const stats = rigStats(final, library);
     return {
-      trusses: sc.trusses.map((t) => ({ count: t.count, positions: fixturePositions(t), locks: fixtureLocks(t) })),
+      trusses: final.trusses.map((t) => ({ count: t.count, positions: fixturePositions(t), locks: fixtureLocks(t) })),
       stats,
       reached: stats.mean >= target,
-      added,
+      added: total(best.counts),
     };
   }
 
@@ -320,7 +370,9 @@
   //
   // Returns { positions: [[...] per truss], before: {cv, u0}, after: {cv, u0}, moved,
   // asymmetric: [truss indices], crowded: [truss indices] } or null when there is nothing free.
-  function optimiseCoverage(scene, library) {
+  // With { quick: true } it searches only from the even spread with coarser steps, for comparing
+  // many candidate layouts cheaply (used by designForTarget).
+  function optimiseCoverage(scene, library, { quick = false } = {}) {
     const placed = placeFixtures(scene, library);
     const free = placed.map((_, k) => k).filter((k) => !placed[k].locked);
     if (!free.length) return null;
@@ -428,7 +480,7 @@
       for (const c of contrib) for (let k = 0; k < n; k++) total[k] += c[k];
       let best = score(total);
       let viol = totalViolation(d);
-      for (const step of [2, 1, 0.5, 0.25, 0.1, 0.05]) {
+      for (const step of quick ? [1, 0.25, 0.05] : [2, 1, 0.5, 0.25, 0.1, 0.05]) {
         for (let pass = 0, improved = true; improved && pass < 40; pass++) {
           improved = false;
           vars.forEach((v, i) => {
@@ -477,8 +529,8 @@
       // A lone fixture starts a quarter of the way along, clear of the locked centre fixture.
       for (let k = 0; k < plan.singles; k++) { currentD.push(snap(plan.L / 4)); evenD.push(snap(plan.L / 4)); }
     }
-    const fromCurrent = descend(currentD);
     const fromEven = descend(evenD);
+    const fromCurrent = quick ? fromEven : descend(currentD);
     const better = (p, q) => p.viol < q.viol - 1e-9 || (Math.abs(p.viol - q.viol) <= 1e-9 && p.best.cost < q.best.cost);
     const result = better(fromEven, fromCurrent) ? fromEven : fromCurrent;
     const crowded = plans.filter((plan) => violation(plan, result.d) > 1e-6).map((plan) => plan.ti);
