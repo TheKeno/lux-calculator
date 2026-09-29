@@ -170,6 +170,132 @@
     return { nx, ny, xs, ys, values, min, max, avg: sum / area, placed };
   }
 
+  // Floor points 0.5 m apart over the area the rig spans: along = union of truss extents,
+  // across = between the outermost truss centrelines (a single truss gets a 1 m band), clamped
+  // to the room.
+  function rigSamples(scene) {
+    const alongX = scene.orientation !== "y";
+    const used = scene.trusses.filter((t) => t.length > 0);
+    if (!used.length) return [];
+    const alongMax = alongX ? scene.width : scene.depth, acrossMax = alongX ? scene.depth : scene.width;
+    const clamp = (v, hi) => Math.max(0, Math.min(hi, v));
+    let a0 = Math.min(...used.map((t) => (alongX ? t.cx : t.cy) - t.length / 2));
+    let a1 = Math.max(...used.map((t) => (alongX ? t.cx : t.cy) + t.length / 2));
+    let c0 = Math.min(...used.map((t) => (alongX ? t.cy : t.cx)));
+    let c1 = Math.max(...used.map((t) => (alongX ? t.cy : t.cx)));
+    if (c1 - c0 < 1) { c0 -= 0.5; c1 += 0.5; }
+    [a0, a1, c0, c1] = [clamp(a0, alongMax), clamp(a1, alongMax), clamp(c0, acrossMax), clamp(c1, acrossMax)];
+
+    const STEP = 0.5;
+    const samples = [];
+    const na = Math.max(1, Math.round((a1 - a0) / STEP)), nc = Math.max(1, Math.round((c1 - c0) / STEP));
+    for (let i = 0; i < na; i++) {
+      for (let j = 0; j < nc; j++) {
+        const a = a0 + ((i + 0.5) * (a1 - a0)) / na, c = c0 + ((j + 0.5) * (c1 - c0)) / nc;
+        samples.push(alongX ? [a, c, 0] : [c, a, 0]);
+      }
+    }
+    return samples;
+  }
+
+  // Average and lowest lux over the rig area (see rigSamples).
+  function rigStats(scene, library) {
+    const placed = placeFixtures(scene, library);
+    const samples = rigSamples(scene);
+    if (!samples.length) return { mean: 0, min: 0, u0: 0 };
+    let sum = 0, min = Infinity;
+    for (const p of samples) { const e = illuminanceAt(placed, p); sum += e; if (e < min) min = e; }
+    const mean = sum / samples.length;
+    return { mean, min, u0: mean > 0 ? min / mean : 0 };
+  }
+
+  // Decides how many fixtures each truss needs, and where, for an average of `target` lux over
+  // the rig area. Trusses, fixture types, dimmers and locked fixtures are kept; unlocked fixtures
+  // are removed and rebuilt. Fixtures are added one at a time to whichever truss gives the most
+  // even light after optimiseCoverage re-arranges them (symmetric, respecting minSpacing), until
+  // the average reaches the target or every truss is full at the minimum spacing. Adding one at a
+  // time can leave the trusses lopsided, so a final pass tries moving single unlocked fixtures
+  // between trusses (same total) and keeps any move that evens the light and still meets target.
+  //
+  // Returns { trusses: [{ count, positions, locks }], stats: {mean, min, u0}, reached, added }.
+  function designForTarget(scene, library, target) {
+    const sc = { ...scene, trusses: scene.trusses.map((t) => {
+      const pos = fixturePositions(t), locks = fixtureLocks(t);
+      const keep = pos.map((p, i) => i).filter((i) => locks[i]);
+      return { ...t, count: keep.length, positions: keep.map((i) => pos[i]), locks: keep.map(() => true) };
+    }) };
+    const spacing = Math.max(0, scene.minSpacing ?? 0);
+    const capacity = (t) => (spacing > 0 ? Math.floor(t.length / spacing + 1e-9) + 1 : 50);
+    const usable = (t) => library.some((f) => f.id === t.fixtureId);
+
+    // A copy of sc with truss ti changed by delta unlocked fixtures, re-arranged by optimiseCoverage.
+    const withCount = (base, changes) => {
+      const trial = { ...base, trusses: base.trusses.map((u, j) => {
+        const delta = changes[j] || 0;
+        if (!delta) return u;
+        let pos = fixturePositions(u), locks = fixtureLocks(u);
+        if (delta > 0) {
+          pos = [...pos, ...Array(delta).fill(u.length / 2)];
+          locks = [...locks, ...Array(delta).fill(false)];
+        } else {
+          for (let r = -delta; r > 0; r--) {
+            const k = locks.lastIndexOf(false);
+            if (k < 0) return null;
+            pos = pos.filter((_, i) => i !== k); locks = locks.filter((_, i) => i !== k);
+          }
+        }
+        return { ...u, count: pos.length, positions: pos, locks };
+      }) };
+      if (trial.trusses.some((u) => u === null)) return null;
+      const r = optimiseCoverage(trial, library);
+      if (r) trial.trusses = trial.trusses.map((u, j) => ({ ...u, positions: r.positions[j] }));
+      return { scene: trial, stats: rigStats(trial, library) };
+    };
+
+    let stats = rigStats(sc, library);
+    let added = 0;
+    while (stats.mean < target) {
+      let best = null;
+      sc.trusses.forEach((t, ti) => {
+        if (!usable(t) || t.count >= capacity(t)) return;
+        const cand = withCount(sc, { [ti]: 1 });
+        // Most even light wins; a clearly higher average breaks ties.
+        if (cand && (!best || cand.stats.u0 > best.stats.u0 + 1e-6 ||
+            (Math.abs(cand.stats.u0 - best.stats.u0) <= 1e-6 && cand.stats.mean > best.stats.mean))) {
+          best = cand;
+        }
+      });
+      if (!best) break;
+      sc.trusses = best.scene.trusses;
+      stats = best.stats;
+      added++;
+    }
+
+    // Rebalance: move one unlocked fixture from truss a to truss b while that evens the light out.
+    for (let round = 0, improved = true; improved && round < 20; round++) {
+      improved = false;
+      for (let a = 0; a < sc.trusses.length && !improved; a++) {
+        if (!fixtureLocks(sc.trusses[a]).includes(false)) continue;
+        for (let b = 0; b < sc.trusses.length && !improved; b++) {
+          const tb = sc.trusses[b];
+          if (a === b || !usable(tb) || tb.count >= capacity(tb)) continue;
+          const cand = withCount(sc, { [a]: -1, [b]: 1 });
+          if (cand && cand.stats.mean >= Math.min(target, stats.mean) && cand.stats.u0 > stats.u0 + 1e-3) {
+            sc.trusses = cand.scene.trusses;
+            stats = cand.stats;
+            improved = true;
+          }
+        }
+      }
+    }
+    return {
+      trusses: sc.trusses.map((t) => ({ count: t.count, positions: fixturePositions(t), locks: fixtureLocks(t) })),
+      stats,
+      reached: stats.mean >= target,
+      added,
+    };
+  }
+
   // Moves unlocked fixtures along their trusses to make the light as even as possible over the
   // area the rig spans (between the outermost trusses, along the full truss extent), keeping each
   // truss's layout symmetric about its centre. Locked fixtures, dimmers and truss positions are
@@ -201,28 +327,7 @@
 
     const alongX = scene.orientation !== "y";
     const ax = alongX ? 0 : 1; // index of the along-truss coordinate
-
-    // Region: along = union of truss extents, across = between outermost truss centrelines
-    // (a single truss gets a 1 m band), clamped to the room.
-    const used = scene.trusses.filter((t) => t.count > 0);
-    const alongMax = alongX ? scene.width : scene.depth, acrossMax = alongX ? scene.depth : scene.width;
-    const clamp = (v, hi) => Math.max(0, Math.min(hi, v));
-    let a0 = Math.min(...used.map((t) => (alongX ? t.cx : t.cy) - t.length / 2));
-    let a1 = Math.max(...used.map((t) => (alongX ? t.cx : t.cy) + t.length / 2));
-    let c0 = Math.min(...used.map((t) => (alongX ? t.cy : t.cx)));
-    let c1 = Math.max(...used.map((t) => (alongX ? t.cy : t.cx)));
-    if (c1 - c0 < 1) { c0 -= 0.5; c1 += 0.5; }
-    [a0, a1, c0, c1] = [clamp(a0, alongMax), clamp(a1, alongMax), clamp(c0, acrossMax), clamp(c1, acrossMax)];
-
-    const STEP = 0.5;
-    const samples = [];
-    const na = Math.max(1, Math.round((a1 - a0) / STEP)), nc = Math.max(1, Math.round((c1 - c0) / STEP));
-    for (let i = 0; i < na; i++) {
-      for (let j = 0; j < nc; j++) {
-        const a = a0 + ((i + 0.5) * (a1 - a0)) / na, c = c0 + ((j + 0.5) * (c1 - c0)) / nc;
-        samples.push(alongX ? [a, c, 0] : [c, a, 0]);
-      }
-    }
+    const samples = rigSamples(scene);
     const n = samples.length;
 
     const trussStart = (f) => {
@@ -418,7 +523,7 @@
     return flux;
   }
 
-  const api = { intensity, evenPositions, fixturePositions, fixtureLocks, spreadPositions, optimiseCoverage, placeFixtures, illuminanceAt, computeGrid, integrateFlux };
+  const api = { intensity, evenPositions, fixturePositions, fixtureLocks, spreadPositions, optimiseCoverage, rigStats, designForTarget, placeFixtures, illuminanceAt, computeGrid, integrateFlux };
   if (typeof module !== "undefined") module.exports = api;
   else window.Photometry = api;
 })();

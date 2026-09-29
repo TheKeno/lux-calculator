@@ -28,7 +28,7 @@
   function defaultScene() {
     const s = {
       width: 20, depth: 14,
-      orientation: "x", fixtureDrop: 0.3, heatOpacity: 1, minSpacing: 0.5, trusses: [],
+      orientation: "x", fixtureDrop: 0.3, heatOpacity: 1, minSpacing: 0.5, designLux: 650, trusses: [],
     };
     for (let i = 0; i < 3; i++) s.trusses.push(defaultTruss(s, i, 3));
     return s;
@@ -59,7 +59,7 @@
   // ---------- sidebar ----------
 
   const roomFields = {
-    "room-width": "width", "room-depth": "depth", "fixture-drop": "fixtureDrop", "min-spacing": "minSpacing",
+    "room-width": "width", "room-depth": "depth", "fixture-drop": "fixtureDrop", "min-spacing": "minSpacing", "design-lux": "designLux",
   };
 
   function syncRoomInputs() {
@@ -311,6 +311,29 @@
     out.textContent = (r.moved
       ? `Min/avg ${r.before.u0.toFixed(2)} → ${r.after.u0.toFixed(2)} · moved ${r.moved} fixture${r.moved === 1 ? "" : "s"}`
       : `Already as even as it gets (min/avg ${r.after.u0.toFixed(2)})`) + note;
+  });
+
+  // Decides fixture counts and positions for the target average lux (see designForTarget).
+  $("btn-design").addEventListener("click", () => {
+    const btn = $("btn-design"), out = $("design-result");
+    const target = scene.designLux;
+    if (!(target > 0)) { out.textContent = "Enter a target lux first."; return; }
+    btn.disabled = true;
+    out.textContent = "Working…";
+    // Let the browser paint "Working…" before the (up to a few seconds) search blocks the page.
+    setTimeout(() => {
+      const r = Photometry.designForTarget(scene, LIB, target);
+      scene.trusses.forEach((t, i) => Object.assign(t, r.trusses[i]));
+      renderTrussList();
+      update();
+      const total = r.trusses.reduce((s, t) => s + t.count, 0);
+      const perTruss = r.trusses.map((t) => t.count).join(" / ");
+      const lead = !r.reached ? `Can't reach ${target} lx with these trusses at ${scene.minSpacing} m spacing. `
+        : r.added === 0 ? "The locked fixtures already reach the target. " : "";
+      out.textContent = lead +
+        `${total} fixtures (${perTruss}) · avg ${Math.round(r.stats.mean)} lx · min ${Math.round(r.stats.min)} lx`;
+      btn.disabled = false;
+    }, 20);
   });
 
   // ---------- calculation ----------

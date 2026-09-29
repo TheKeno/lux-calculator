@@ -143,3 +143,6 @@ input:disabled { opacity: .55; cursor: not-allowed; }
 .optimise-row .spacing input { width: 64px; margin: 0; padding: 3px 6px; font-size: 13px; }
 #optimise-result { margin: 6px 0 0; }
 #optimise-result:empty { display: none; }
+#design-result { margin: 6px 0 0; }
+#design-result:empty { display: none; }
+button:disabled { opacity: .6; cursor: progress; }
