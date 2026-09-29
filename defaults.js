@@ -2,8 +2,6 @@
 window.DEFAULT_SETUP = {
   "width": 16.3,
   "depth": 10.8,
-  "workPlane": 0,
-  "maintenance": 0.9,
   "orientation": "x",
   "fixtureDrop": 0.3,
   "heatOpacity": 0.6,
@@ -19,9 +17,9 @@ window.DEFAULT_SETUP = {
       "positions": [
         0,
         3.8,
-        7.5,
         15,
-        11.2
+        11.2,
+        7.5
       ],
       "lockX": true,
       "lockY": true,
@@ -61,16 +59,18 @@ window.DEFAULT_SETUP = {
       "length": 15,
       "cx": 8.2,
       "cy": 9,
-      "count": 4,
+      "count": 5,
       "dimmer": 100,
       "fixtureId": "XFL300TW-2800K",
       "positions": [
         0,
         3,
         15,
-        12
+        12,
+        7.5
       ],
       "locks": [
+        true,
         true,
         true,
         true,
@@ -78,6 +78,8 @@ window.DEFAULT_SETUP = {
       ]
     }
   ],
+  "workPlane": 0,
+  "maintenance": 0.9,
   "targetLux": 300,
   "planOpacity": 1,
   "gridStep": 0.25
