@@ -47,6 +47,20 @@
     return evenPositions(t.length, t.count);
   }
 
+  // Per-fixture aim points for a truss, always `count` long: [x, y] on the floor, or null for
+  // straight down. Only used when the scene has panTilt switched on.
+  function fixtureAims(t) {
+    return Array.from({ length: t.count }, (_, i) => {
+      const a = t.aims && t.aims[i];
+      return Array.isArray(a) && a.length === 2 && a.every(Number.isFinite) ? [a[0], a[1]] : null;
+    });
+  }
+
+  // Tilt in degrees from straight down for a fixture at pos = [x, y, z] aimed at floor point aim.
+  function tiltTowards(pos, aim) {
+    return (Math.atan2(Math.hypot(aim[0] - pos[0], aim[1] - pos[1]), pos[2]) * 180) / Math.PI;
+  }
+
   // Per-fixture lock flags for a truss, always `count` long.
   function fixtureLocks(t) {
     return Array.from({ length: t.count }, (_, i) => !!(t.locks && t.locks[i]));
@@ -91,30 +105,53 @@
     return out;
   }
 
-  // Expands a scene into a flat list of placed fixtures, all aimed straight down.
-  // scene: { orientation: "x"|"y", fixtureDrop, trusses: [{ cx, cy, height, length, count,
-  //          positions, fixtureId, dimmer }] }
+  // Photometric frame for a fixture pointing along `axis` (unit vector): u is the C0 direction,
+  // kept as close to the truss direction as possible; v = axis × u is C90.
+  function aimFrame(axis, along) {
+    const k = dot(along, axis);
+    let u = [along[0] - k * axis[0], along[1] - k * axis[1], along[2] - k * axis[2]];
+    let len = Math.hypot(...u);
+    if (len < 1e-6) { u = cross(axis, [0, 0, 1]); len = Math.hypot(...u); } // aimed along the truss
+    u = u.map((c) => c / len);
+    return { axis, u, v: cross(axis, u) };
+  }
+
+  // Expands a scene into a flat list of placed fixtures. They point straight down, unless
+  // scene.panTilt is on and the fixture has an aim point, in which case it points at that spot on
+  // the floor. `fixed` marks fixtures the optimisers must not move: locked, or aimed (pan/tilt on).
+  // scene: { orientation: "x"|"y", fixtureDrop, panTilt, trusses: [{ cx, cy, height, length, count,
+  //          positions, locks, aims, fixtureId, dimmer }] }
   function placeFixtures(scene, library) {
     const out = [];
     const along = scene.orientation === "y" ? [0, 1, 0] : [1, 0, 0];
-    const axis = [0, 0, -1];
-    const u = along;
-    const v = cross(axis, u);
+    const down = aimFrame([0, 0, -1], along);
     for (const [ti, t] of scene.trusses.entries()) {
       const fx = library.find((f) => f.id === t.fixtureId);
       if (!fx || t.count < 1) continue;
       const z = t.height - scene.fixtureDrop;
       const positions = fixturePositions(t);
       const locks = fixtureLocks(t);
+      const aims = scene.panTilt ? fixtureAims(t) : [];
       for (let i = 0; i < t.count; i++) {
         const s = -t.length / 2 + positions[i];
+        const pos = [t.cx + along[0] * s, t.cy + along[1] * s, z];
+        const aim = aims[i] || null;
+        let frame = down;
+        if (aim) {
+          const d = [aim[0] - pos[0], aim[1] - pos[1], -pos[2]];
+          const len = Math.hypot(...d);
+          if (len > 1e-6) frame = aimFrame(d.map((c) => c / len), along);
+        }
         out.push({
           truss: ti,
           index: i,
           locked: locks[i],
+          aim,
+          tilt: aim ? tiltTowards(pos, aim) : 0,
+          fixed: locks[i] || !!aim,
           fx,
-          pos: [t.cx + along[0] * s, t.cy + along[1] * s, z],
-          axis, u, v,
+          pos,
+          ...frame,
           scale: t.dimmer / 100,
         });
       }
@@ -233,7 +270,7 @@
     const capacity = scene.trusses.map((t, i) =>
       (usable[i] ? (spacing > 0 ? Math.floor(t.length / spacing + 1e-9) + 1 : 50) : 0));
     const maxTotal = capacity.reduce((a, b) => a + b, 0);
-    const empty = { trusses: scene.trusses.map(() => ({ count: 0, positions: [], locks: [] })), stats: { mean: 0, min: 0, u0: 0 }, reached: target <= 0, added: 0 };
+    const empty = { trusses: scene.trusses.map(() => ({ count: 0, positions: [], locks: [], aims: [] })), stats: { mean: 0, min: 0, u0: 0 }, reached: target <= 0, added: 0 };
     if (!maxTotal) return empty;
 
     const BALANCE_WEIGHT = 0.1;
@@ -247,7 +284,7 @@
       const key = counts.join(",");
       if (cache.has(key)) return cache.get(key);
       const trial = { ...scene, trusses: scene.trusses.map((t, i) => ({
-        ...t, count: counts[i], positions: evenPositions(t.length, counts[i]), locks: Array(counts[i]).fill(false),
+        ...t, count: counts[i], positions: evenPositions(t.length, counts[i]), locks: Array(counts[i]).fill(false), aims: [],
       })) };
       const r = counts.some((c) => c > 0) ? optimiseCoverage(trial, library, { quick: true }) : null;
       if (r) trial.trusses = trial.trusses.map((t, i) => ({ ...t, positions: r.positions[i] }));
@@ -339,7 +376,7 @@
     if (polished) final.trusses = final.trusses.map((t, i) => ({ ...t, positions: polished.positions[i] }));
     const stats = rigStats(final, library);
     return {
-      trusses: final.trusses.map((t) => ({ count: t.count, positions: fixturePositions(t), locks: fixtureLocks(t) })),
+      trusses: final.trusses.map((t) => ({ count: t.count, positions: fixturePositions(t), locks: fixtureLocks(t), aims: [] })),
       stats,
       reached: stats.mean >= target,
       added: total(best.counts),
@@ -374,7 +411,7 @@
   // many candidate layouts cheaply (used by designForTarget).
   function optimiseCoverage(scene, library, { quick = false } = {}) {
     const placed = placeFixtures(scene, library);
-    const free = placed.map((_, k) => k).filter((k) => !placed[k].locked);
+    const free = placed.map((_, k) => k).filter((k) => !placed[k].fixed);
     if (!free.length) return null;
 
     const alongX = scene.orientation !== "y";
@@ -410,7 +447,7 @@
     // Locked fixtures never move, so their light is a constant background.
     const constTotal = new Float64Array(n);
     for (const f of placed) {
-      if (!f.locked) continue;
+      if (!f.fixed) continue;
       const c = contribution(f);
       for (let k = 0; k < n; k++) constTotal[k] += c[k];
     }
@@ -420,10 +457,10 @@
     const asymmetric = [];
     scene.trusses.forEach((t, ti) => {
       const members = placed.filter((f) => f.truss === ti);
-      const freeF = members.filter((f) => !f.locked);
+      const freeF = members.filter((f) => !f.fixed);
       if (!freeF.length) return;
       const L = t.length, mid = L / 2, TOL = 0.01;
-      const lockedPos = members.filter((f) => f.locked).map((f) => f.pos[ax] - trussStart(f));
+      const lockedPos = members.filter((f) => f.fixed).map((f) => f.pos[ax] - trussStart(f));
       const matched = lockedPos.map(() => false);
       const unmatched = []; // mirror positions a free fixture should take
       lockedPos.forEach((p, i) => {
@@ -575,7 +612,7 @@
     return flux;
   }
 
-  const api = { intensity, evenPositions, fixturePositions, fixtureLocks, spreadPositions, optimiseCoverage, rigStats, designForTarget, placeFixtures, illuminanceAt, computeGrid, integrateFlux };
+  const api = { intensity, evenPositions, fixturePositions, fixtureLocks, fixtureAims, tiltTowards, spreadPositions, optimiseCoverage, rigStats, designForTarget, placeFixtures, illuminanceAt, computeGrid, integrateFlux };
   if (typeof module !== "undefined") module.exports = api;
   else window.Photometry = api;
 })();

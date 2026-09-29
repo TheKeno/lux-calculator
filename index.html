@@ -73,11 +73,20 @@
 
     <section class="main">
       <div class="stats" id="stats"></div>
+      <div class="plan-toolbar">
+        <button type="button" id="btn-pantilt" aria-pressed="false" title="Turn pan/tilt on to aim fixtures. Off: every fixture points straight down (aims are kept for next time).">Pan/Tilt</button>
+        <div class="segmented" id="tool-switch" hidden>
+          <button type="button" data-tool="move" aria-pressed="true">Move</button>
+          <button type="button" data-tool="aim" aria-pressed="false">Aim</button>
+        </div>
+        <button type="button" id="btn-reset-aims" hidden title="Point every fixture straight down">Reset aims</button>
+        <span class="hint" id="tool-hint"></span>
+      </div>
       <div class="plan-wrap" id="plan-wrap">
         <canvas id="plan"></canvas>
         <div class="tooltip" id="tooltip" hidden></div>
       </div>
-      <p class="hint">Top view, origin at the top-left corner. Each 1 m square shows the illuminance at its centre. Drag a fixture to slide it along its truss, click it to lock it in place, or drag the truss itself to move it. Fixtures point straight down.</p>
+      <p class="hint">Top view, origin at the top-left corner. Each 1 m square shows the illuminance at its centre. Drag a fixture to slide it along its truss, click it to lock it in place, or drag the truss itself to move it. Fixtures point straight down unless Pan/Tilt is on.</p>
     </section>
   </main>
 

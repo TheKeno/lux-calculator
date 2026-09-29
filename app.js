@@ -28,7 +28,7 @@
   function defaultScene() {
     const s = {
       width: 20, depth: 14,
-      orientation: "x", fixtureDrop: 0.3, heatOpacity: 1, minSpacing: 0.5, designLux: 650, trusses: [],
+      orientation: "x", fixtureDrop: 0.3, heatOpacity: 1, minSpacing: 0.5, designLux: 650, panTilt: false, trusses: [],
     };
     for (let i = 0; i < 3; i++) s.trusses.push(defaultTruss(s, i, 3));
     return s;
@@ -51,6 +51,7 @@
   const DEFAULT_FLOORPLAN = "floorplan.png"; // loaded from the project folder at startup, if present
   let result = null;
   let activeTruss = -1;
+  let tool = "move"; // "move" | "aim"; only meaningful while scene.panTilt is on
 
   function save() {
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(scene)); } catch (e) { /* ignore */ }
@@ -205,13 +206,29 @@
   // and re-spreading the free ones around them.
   function setFixtureCount(t, n) {
     const locks = Photometry.fixtureLocks(t);
-    const items = Photometry.fixturePositions(t).map((p, f) => ({ p, locked: locks[f] }));
+    const aims = Photometry.fixtureAims(t);
+    const items = Photometry.fixturePositions(t).map((p, f) => ({ p, locked: locks[f], aim: aims[f] }));
     for (let f = items.length - 1; f >= 0 && items.length > n; f--) if (!items[f].locked) items.splice(f, 1);
     items.length = Math.min(items.length, n);
-    while (items.length < n) items.push({ p: t.length, locked: false });
+    while (items.length < n) items.push({ p: t.length, locked: false, aim: null });
     t.count = n;
     t.locks = items.map((it) => it.locked);
+    t.aims = items.map((it) => it.aim);
     t.positions = Photometry.spreadPositions(t.length, items.map((it) => it.p), t.locks);
+  }
+
+  // Tilt in degrees per fixture of truss i (0 = straight down / not aimed).
+  function fixtureTilts(i) {
+    const t = scene.trusses[i];
+    const alongX = scene.orientation === "x";
+    const z = t.height - scene.fixtureDrop;
+    const aims = Photometry.fixtureAims(t);
+    return Photometry.fixturePositions(t).map((s, f) => {
+      if (!aims[f]) return 0;
+      const a = (alongX ? t.cx : t.cy) - t.length / 2 + s;
+      const pos = alongX ? [a, t.cy, z] : [t.cx, a, z];
+      return Photometry.tiltTowards(pos, aims[f]);
+    });
   }
 
   function refreshPositions(i) {
@@ -220,8 +237,9 @@
     const t = scene.trusses[i];
     const pos = Photometry.fixturePositions(t);
     const locks = Photometry.fixtureLocks(t);
+    const tilts = scene.panTilt ? fixtureTilts(i) : [];
     node.querySelector(".positions").textContent = pos.length
-      ? `At ${pos.map((p, f) => p.toFixed(2) + (locks[f] ? " 🔒" : "")).join(", ")} m`
+      ? `At ${pos.map((p, f) => p.toFixed(2) + (tilts[f] ? ` (${Math.round(tilts[f])}°)` : "") + (locks[f] ? " 🔒" : "")).join(", ")} m`
       : "No fixtures";
     node.querySelector(".positions").title = "Fixture positions, measured from the truss start";
   }
@@ -273,6 +291,7 @@
     scene = Object.assign(defaultScene(), setup);
     syncRoomInputs();
     renderTrussList();
+    syncPanTiltUi();
     update();
   }
 
@@ -333,6 +352,35 @@
         `${total} fixtures (${perTruss}) · avg ${Math.round(r.stats.mean)} lx · min ${Math.round(r.stats.min)} lx`;
       btn.disabled = false;
     }, 20);
+  });
+
+  // ---------- pan/tilt toolbar ----------
+
+  function syncPanTiltUi() {
+    const on = !!scene.panTilt;
+    if (!on) tool = "move";
+    $("btn-pantilt").setAttribute("aria-pressed", on);
+    $("tool-switch").hidden = !on;
+    $("btn-reset-aims").hidden = !on;
+    for (const b of $("tool-switch").querySelectorAll("button")) b.setAttribute("aria-pressed", b.dataset.tool === tool);
+    $("tool-hint").textContent = !on ? ""
+      : tool === "aim" ? "Drag from a fixture to where it should point · double-click a fixture to point it straight down"
+      : "Aimed fixtures keep pointing at their spot when moved";
+    scene.trusses.forEach((_, i) => refreshPositions(i));
+  }
+
+  $("btn-pantilt").addEventListener("click", () => {
+    scene.panTilt = !scene.panTilt;
+    syncPanTiltUi();
+    update();
+  });
+  for (const b of $("tool-switch").querySelectorAll("button")) {
+    b.addEventListener("click", () => { tool = b.dataset.tool; syncPanTiltUi(); draw(); });
+  }
+  $("btn-reset-aims").addEventListener("click", () => {
+    for (const t of scene.trusses) t.aims = [];
+    syncPanTiltUi();
+    update();
   });
 
   // ---------- calculation ----------
@@ -496,6 +544,7 @@
       drawLuxText(c.text, c.x, c.y);
     }
 
+    if (scene.panTilt) drawAimArrows();
     if (drag && drag.kind === "fixture" && drag.moved) drawDistanceArrows(drag.index, drag.fixture);
     if (drag && drag.kind === "truss" && drag.moved) drawTrussWallArrows(drag.index);
 
@@ -642,7 +691,7 @@
   function drawTrusses() {
     ctx.font = TAG_FONT;
     scene.trusses.forEach((t, i) => {
-      const active = i === activeTruss || (drag && drag.index === i);
+      const active = i === activeTruss || (drag && drag.kind !== "aim" && drag.index === i);
       drawTrussShape(t, active);
       // Tag on a solid pill just outside the truss's start end, so it stays readable over values.
       const label = `T${i + 1}`;
@@ -805,6 +854,55 @@
     if (Number.isFinite(after)) drawDimArrow(P(trussAt, across, halfW), P(trussAt, after, -halfW), after - across);
   }
 
+  // Pan/tilt on: a faint arrow from each aimed fixture to its aim spot, labelled with the tilt.
+  // The one being aimed is drawn in solid blue.
+  function drawAimArrows() {
+    for (const p of result.placed) {
+      if (!p.aim) continue;
+      const active = drag && drag.kind === "aim" && drag.index === p.truss && drag.fixture === p.index;
+      const [fx, fy] = toPx(p.pos[0], p.pos[1]);
+      const [ax, ay] = toPx(p.aim[0], p.aim[1]);
+      const len = Math.hypot(ax - fx, ay - fy);
+      const label = `${Math.round(p.tilt)}°`;
+      ctx.save();
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      if (len > FIXTURE_R + 6) {
+        const u = [(ax - fx) / len, (ay - fy) / len];
+        const sx = fx + u[0] * (FIXTURE_R + 2), sy = fy + u[1] * (FIXTURE_R + 2);
+        const head = 9, w = 5;
+        const hx = ax - u[0] * head, hy = ay - u[1] * head;
+        const path = () => {
+          ctx.beginPath();
+          ctx.moveTo(sx, sy); ctx.lineTo(ax, ay);
+          ctx.moveTo(hx - u[1] * w, hy + u[0] * w); ctx.lineTo(ax, ay); ctx.lineTo(hx + u[1] * w, hy - u[0] * w);
+        };
+        const casing = active ? "#ffffff" : "rgba(0,0,0,0.35)";
+        const stroke = active ? DIM_BLUE : "rgba(255,255,255,0.75)";
+        ctx.strokeStyle = casing; ctx.lineWidth = active ? 4.5 : 3.5; path(); ctx.stroke();
+        ctx.strokeStyle = stroke; ctx.lineWidth = active ? 2 : 1.5; path(); ctx.stroke();
+        // Tilt label just past the arrowhead.
+        drawAimLabel(label, ax + u[0] * 16, ay + u[1] * 16, active);
+      } else {
+        drawAimLabel(label, fx + FIXTURE_R + 14, fy - FIXTURE_R, active);
+      }
+      ctx.restore();
+    }
+  }
+
+  function drawAimLabel(text, x, y, active) {
+    ctx.font = `600 ${active ? 13 : 11}px system-ui, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const tw = ctx.measureText(text).width + 8, th = active ? 18 : 15;
+    ctx.fillStyle = active ? DIM_BLUE : "rgba(20,20,22,0.7)";
+    ctx.beginPath();
+    ctx.roundRect(x - tw / 2, y - th / 2, tw, th, 4);
+    ctx.fill();
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText(text, x, y + 0.5);
+  }
+
   function drawPadlock(cx, cy, locked) {
     const color = locked ? "#141416" : "#7a7a80";
     ctx.save();
@@ -883,6 +981,14 @@
     const [px, py] = eventPos(e);
     const [wx, wy] = toWorld(px, py);
     const f = hitFixture(px, py);
+    if (scene.panTilt && tool === "aim") {
+      if (!f) return;
+      drag = { kind: "aim", index: f.truss, fixture: f.fixture, startX: px, startY: py, moved: false };
+      tooltip.hidden = true;
+      canvas.setPointerCapture(e.pointerId);
+      canvas.style.cursor = "crosshair";
+      return;
+    }
     if (f) {
       // A fixture press is a click (toggle lock) until the pointer moves a few px, then a drag.
       drag = { kind: "fixture", index: f.truss, fixture: f.fixture, startX: px, startY: py, moved: false };
@@ -907,6 +1013,17 @@
   canvas.addEventListener("pointermove", (e) => {
     const [px, py] = eventPos(e);
     const [wx, wy] = toWorld(px, py);
+    if (drag && drag.kind === "aim") {
+      if (!drag.moved && Math.hypot(px - drag.startX, py - drag.startY) < 4) return;
+      drag.moved = true;
+      const t = scene.trusses[drag.index];
+      const snap = (v, hi) => Math.round(Math.max(0, Math.min(hi, v)) * 10) / 10; // 10 cm, inside the room
+      t.aims = Photometry.fixtureAims(t);
+      t.aims[drag.fixture] = [snap(wx, scene.width), snap(wy, scene.depth)];
+      refreshPositions(drag.index);
+      scheduleUpdate();
+      return;
+    }
     if (drag && drag.kind === "truss") {
       const t = scene.trusses[drag.index];
       drag.moved = true;
@@ -941,16 +1058,24 @@
     const changed = (f && f.truss) !== (hover && hover.truss) || (f && f.fixture) !== (hover && hover.fixture);
     hover = f;
     if (changed) draw();
+    if (f && scene.panTilt && tool === "aim") {
+      const tilt = fixtureTilts(f.truss)[f.fixture];
+      canvas.style.cursor = "crosshair";
+      showTooltip(`<b>T${f.truss + 1} · fixture ${f.fixture + 1}</b> · ${tilt ? `tilt ${Math.round(tilt)}°` : "straight down"}<br>` +
+        "Drag to aim · double-click to point straight down", px, py);
+      return;
+    }
     if (f) {
       const t = scene.trusses[f.truss];
       const locked = Photometry.fixtureLocks(t)[f.fixture];
       const at = Photometry.fixturePositions(t)[f.fixture];
       canvas.style.cursor = locked ? "pointer" : scene.orientation === "y" ? "ns-resize" : "ew-resize";
-      showTooltip(`<b>T${f.truss + 1} · fixture ${f.fixture + 1}</b> · ${at.toFixed(2)} m${locked ? " · locked" : ""}<br>` +
+      const tilt = scene.panTilt ? fixtureTilts(f.truss)[f.fixture] : 0;
+      showTooltip(`<b>T${f.truss + 1} · fixture ${f.fixture + 1}</b> · ${at.toFixed(2)} m${tilt ? ` · tilt ${Math.round(tilt)}°` : ""}${locked ? " · locked" : ""}<br>` +
         (locked ? "Click to unlock" : "Click to lock · drag to move"), px, py);
       return;
     }
-    canvas.style.cursor = trussCursor(hitTruss(wx, wy));
+    canvas.style.cursor = scene.panTilt && tool === "aim" ? "default" : trussCursor(hitTruss(wx, wy));
     if (wx < 0 || wy < 0 || wx > scene.width || wy > scene.depth) { tooltip.hidden = true; return; }
     const lux = Photometry.illuminanceAt(result.placed, [wx, wy, 0]);
     showTooltip(`<b>${Math.round(lux)} lx</b><br>x ${wx.toFixed(2)} m · y ${wy.toFixed(2)} m`, px, py);
@@ -958,7 +1083,7 @@
 
   const endDrag = () => { if (drag) { drag = null; canvas.style.cursor = ""; update(); } };
   canvas.addEventListener("pointerup", () => {
-    if (drag && drag.kind === "fixture" && !drag.moved) {
+    if (drag && drag.kind === "fixture" && !drag.moved && !(scene.panTilt && tool === "aim")) {
       const t = scene.trusses[drag.index];
       t.locks = Photometry.fixtureLocks(t);
       t.locks[drag.fixture] = !t.locks[drag.fixture];
@@ -968,6 +1093,17 @@
     endDrag();
   });
   canvas.addEventListener("pointercancel", endDrag);
+  canvas.addEventListener("dblclick", (e) => {
+    if (!scene.panTilt || tool !== "aim") return;
+    const [px, py] = eventPos(e);
+    const f = hitFixture(px, py);
+    if (!f) return;
+    const t = scene.trusses[f.truss];
+    t.aims = Photometry.fixtureAims(t);
+    t.aims[f.fixture] = null;
+    refreshPositions(f.truss);
+    update();
+  });
   canvas.addEventListener("pointerleave", () => { tooltip.hidden = true; if (hover) { hover = null; draw(); } });
 
   window.addEventListener("resize", draw);
@@ -982,6 +1118,7 @@
   renderLibrary();
   syncRoomInputs();
   renderTrussList();
+  syncPanTiltUi();
   update();
 
   // First visit in this browser: use the live defaults.json, which may be newer than defaults.js.
