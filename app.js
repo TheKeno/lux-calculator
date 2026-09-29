@@ -34,11 +34,15 @@
     return s;
   }
 
+  // The setup this browser last used; on a first visit, the project's defaults (see fetchDefaults).
+  let firstVisit = false;
   function loadScene() {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) return Object.assign(defaultScene(), JSON.parse(raw));
     } catch (e) { /* storage unavailable or corrupt: fall back to defaults */ }
+    firstVisit = true;
+    if (window.DEFAULT_SETUP) return Object.assign(defaultScene(), structuredClone(window.DEFAULT_SETUP));
     return defaultScene();
   }
 
@@ -272,15 +276,18 @@
     update();
   }
 
-  // Loads defaults.json. Browsers block that read when the page is opened from disk, so fall back
+  // Reads defaults.json. Browsers block that read when the page is opened from disk, so fall back
   // to defaults.js, a copy generated from it by `node tools/build-defaults.mjs`.
-  $("btn-defaults").addEventListener("click", async () => {
-    let setup = null;
+  async function fetchDefaults() {
     try {
       const res = await fetch("defaults.json", { cache: "no-store" });
-      if (res.ok) setup = await res.json();
+      if (res.ok) return await res.json();
     } catch (e) { /* file:// or offline: use the generated copy */ }
-    if (!setup && window.DEFAULT_SETUP) setup = structuredClone(window.DEFAULT_SETUP);
+    return window.DEFAULT_SETUP ? structuredClone(window.DEFAULT_SETUP) : null;
+  }
+
+  $("btn-defaults").addEventListener("click", async () => {
+    const setup = await fetchDefaults();
     if (!setup) {
       alert("No defaults found. Save a setup as defaults.json in the project folder, then run: node tools/build-defaults.mjs");
       return;
@@ -936,4 +943,7 @@
   syncRoomInputs();
   renderTrussList();
   update();
+
+  // First visit in this browser: use the live defaults.json, which may be newer than defaults.js.
+  if (firstVisit) fetchDefaults().then((setup) => { if (setup) applySetup(setup); });
 })();
