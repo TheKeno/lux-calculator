@@ -170,6 +170,238 @@
     return { nx, ny, xs, ys, values, min, max, avg: sum / area, placed };
   }
 
+  // Moves unlocked fixtures along their trusses to make the light as even as possible over the
+  // area the rig spans (between the outermost trusses, along the full truss extent), keeping each
+  // truss's layout symmetric about its centre. Locked fixtures, dimmers and truss positions are
+  // left alone.
+  //
+  // Symmetry, per truss: a locked fixture with no locked twin at its mirror position gets a free
+  // fixture placed there; the remaining free fixtures form mirrored pairs at centre ± d, plus one
+  // at the centre if their number is odd. If there aren't enough free fixtures to twin every
+  // unmatched locked one, or the odd one's centre spot is already taken by a locked fixture (it
+  // then moves on its own), that truss can't be symmetric and is reported in `asymmetric`.
+  //
+  // Spacing: no two fixtures on a truss (locked ones included) may end up closer than
+  // scene.minSpacing. It's a hard rule: a move is accepted if it reduces spacing violations, or
+  // keeps them at zero and improves evenness. So a start that breaks the rule is repaired first.
+  // Trusses where the fixtures can't fit that far apart are reported in `crowded`.
+  //
+  // Evenness is scored on a 0.5 m sample grid as the coefficient of variation (std/mean) minus a
+  // small reward for the min/avg ratio. The search is coordinate descent over the pair offsets d:
+  // each tries steps either way, shrinking from 2 m to 5 cm, keeping any move that lowers the
+  // score. It runs from the current layout and from an even spread, and keeps the better result.
+  // Each pair's contribution at every sample is cached, so a trial move only recomputes one pair.
+  //
+  // Returns { positions: [[...] per truss], before: {cv, u0}, after: {cv, u0}, moved,
+  // asymmetric: [truss indices], crowded: [truss indices] } or null when there is nothing free.
+  function optimiseCoverage(scene, library) {
+    const placed = placeFixtures(scene, library);
+    const free = placed.map((_, k) => k).filter((k) => !placed[k].locked);
+    if (!free.length) return null;
+
+    const alongX = scene.orientation !== "y";
+    const ax = alongX ? 0 : 1; // index of the along-truss coordinate
+
+    // Region: along = union of truss extents, across = between outermost truss centrelines
+    // (a single truss gets a 1 m band), clamped to the room.
+    const used = scene.trusses.filter((t) => t.count > 0);
+    const alongMax = alongX ? scene.width : scene.depth, acrossMax = alongX ? scene.depth : scene.width;
+    const clamp = (v, hi) => Math.max(0, Math.min(hi, v));
+    let a0 = Math.min(...used.map((t) => (alongX ? t.cx : t.cy) - t.length / 2));
+    let a1 = Math.max(...used.map((t) => (alongX ? t.cx : t.cy) + t.length / 2));
+    let c0 = Math.min(...used.map((t) => (alongX ? t.cy : t.cx)));
+    let c1 = Math.max(...used.map((t) => (alongX ? t.cy : t.cx)));
+    if (c1 - c0 < 1) { c0 -= 0.5; c1 += 0.5; }
+    [a0, a1, c0, c1] = [clamp(a0, alongMax), clamp(a1, alongMax), clamp(c0, acrossMax), clamp(c1, acrossMax)];
+
+    const STEP = 0.5;
+    const samples = [];
+    const na = Math.max(1, Math.round((a1 - a0) / STEP)), nc = Math.max(1, Math.round((c1 - c0) / STEP));
+    for (let i = 0; i < na; i++) {
+      for (let j = 0; j < nc; j++) {
+        const a = a0 + ((i + 0.5) * (a1 - a0)) / na, c = c0 + ((j + 0.5) * (c1 - c0)) / nc;
+        samples.push(alongX ? [a, c, 0] : [c, a, 0]);
+      }
+    }
+    const n = samples.length;
+
+    const trussStart = (f) => {
+      const t = scene.trusses[f.truss];
+      return (alongX ? t.cx : t.cy) - t.length / 2;
+    };
+    const at = (f, s) => {
+      const pos = f.pos.slice();
+      pos[ax] = trussStart(f) + s;
+      return { ...f, pos };
+    };
+    const contribution = (f) => {
+      const out = new Float64Array(n);
+      for (let k = 0; k < n; k++) out[k] = illuminanceAt([f], samples[k]);
+      return out;
+    };
+    const score = (total) => {
+      let sum = 0, min = Infinity;
+      for (let k = 0; k < n; k++) { sum += total[k]; if (total[k] < min) min = total[k]; }
+      const mean = sum / n;
+      if (mean <= 0) return { cost: Infinity, cv: 0, u0: 0 };
+      let v = 0;
+      for (let k = 0; k < n; k++) v += (total[k] - mean) ** 2;
+      const cv = Math.sqrt(v / n) / mean, u0 = min / mean;
+      return { cost: cv - 0.5 * u0, cv, u0 };
+    };
+
+    // Locked fixtures never move, so their light is a constant background.
+    const constTotal = new Float64Array(n);
+    for (const f of placed) {
+      if (!f.locked) continue;
+      const c = contribution(f);
+      for (let k = 0; k < n; k++) constTotal[k] += c[k];
+    }
+
+    // Per-truss symmetric plan: fixed target positions plus mirrored pair variables.
+    const plans = [];
+    const asymmetric = [];
+    scene.trusses.forEach((t, ti) => {
+      const members = placed.filter((f) => f.truss === ti);
+      const freeF = members.filter((f) => !f.locked);
+      if (!freeF.length) return;
+      const L = t.length, mid = L / 2, TOL = 0.01;
+      const lockedPos = members.filter((f) => f.locked).map((f) => f.pos[ax] - trussStart(f));
+      const matched = lockedPos.map(() => false);
+      const unmatched = []; // mirror positions a free fixture should take
+      lockedPos.forEach((p, i) => {
+        if (matched[i]) return;
+        matched[i] = true;
+        if (Math.abs(p - mid) < TOL) return;
+        const j = lockedPos.findIndex((q, k) => !matched[k] && Math.abs(q - (L - p)) < TOL);
+        if (j >= 0) matched[j] = true; else unmatched.push(L - p);
+      });
+      if (unmatched.length > freeF.length) asymmetric.push(ti);
+      const fixed = unmatched.slice(0, freeF.length);
+      const rest = freeF.length - fixed.length;
+      const centreTaken = lockedPos.some((p) => Math.abs(p - mid) < TOL);
+      const centre = rest % 2 === 1 && !centreTaken;
+      const singles = rest % 2 === 1 && centreTaken ? 1 : 0;
+      if (centre) fixed.push(mid);
+      if (singles) asymmetric.push(ti);
+      plans.push({ ti, L, mid, freeF, fixed, centre, lockedPos, pairs: Math.floor(rest / 2), singles, template: freeF[0], varIdx: [] });
+    });
+
+    const slot = (plan, pos) => contribution(at(plan.template, pos));
+    for (const plan of plans) {
+      for (const p of plan.fixed) { const c = slot(plan, p); for (let k = 0; k < n; k++) constTotal[k] += c[k]; }
+    }
+    const vars = plans.flatMap((plan) => [
+      ...Array.from({ length: plan.pairs }, () => ({ plan, pair: true })),
+      ...Array.from({ length: plan.singles }, () => ({ plan, pair: false })),
+    ]);
+    vars.forEach((v, i) => v.plan.varIdx.push(i));
+    const varPositions = (v, val) => (v.pair ? [v.plan.mid - val, v.plan.mid + val] : [val]);
+    const varMax = (v) => (v.pair ? v.plan.mid : v.plan.L);
+
+    // How far a truss's layout falls short of the minimum spacing (0 when every gap is wide enough).
+    const SPACING = Math.max(0, scene.minSpacing ?? 0);
+    const violation = (plan, d) => {
+      const all = [...plan.lockedPos, ...plan.fixed];
+      for (const i of plan.varIdx) all.push(...varPositions(vars[i], d[i]));
+      all.sort((p, q) => p - q);
+      let v = 0;
+      for (let k = 1; k < all.length; k++) v += Math.max(0, SPACING - (all[k] - all[k - 1]) - 1e-6);
+      return v;
+    };
+    const totalViolation = (d) => plans.reduce((sum, plan) => sum + violation(plan, d), 0);
+    const varContribution = (v, val) => {
+      const out = new Float64Array(n);
+      for (const p of varPositions(v, val)) { const c = slot(v.plan, p); for (let k = 0; k < n; k++) out[k] += c[k]; }
+      return out;
+    };
+
+    function descend(startD) {
+      const d = startD.slice();
+      const contrib = vars.map((v, i) => varContribution(v, d[i]));
+      const total = Float64Array.from(constTotal);
+      for (const c of contrib) for (let k = 0; k < n; k++) total[k] += c[k];
+      let best = score(total);
+      let viol = totalViolation(d);
+      for (const step of [2, 1, 0.5, 0.25, 0.1, 0.05]) {
+        for (let pass = 0, improved = true; improved && pass < 40; pass++) {
+          improved = false;
+          vars.forEach((v, i) => {
+            const plan = v.plan;
+            for (const delta of [-step, step]) {
+              const nd = Math.max(0, Math.min(varMax(v), d[i] + delta));
+              if (nd === d[i]) continue;
+              const old = d[i];
+              const oldPlanViol = violation(plan, d);
+              d[i] = nd;
+              const newViol = viol - oldPlanViol + violation(plan, d);
+              d[i] = old;
+              if (newViol > viol + 1e-9) continue; // never trade spacing for evenness
+              const nc = varContribution(v, nd);
+              for (let q = 0; q < n; q++) total[q] += nc[q] - contrib[i][q];
+              const trial = score(total);
+              if (newViol < viol - 1e-9 || trial.cost < best.cost - 1e-9) {
+                best = trial; d[i] = nd; contrib[i] = nc; viol = newViol; improved = true;
+              } else {
+                for (let q = 0; q < n; q++) total[q] -= nc[q] - contrib[i][q];
+              }
+            }
+          });
+        }
+      }
+      return { d, best, viol };
+    }
+
+    const startScore = (() => {
+      const total = new Float64Array(n);
+      for (const f of placed) { const c = contribution(f); for (let k = 0; k < n; k++) total[k] += c[k]; }
+      return score(total);
+    })();
+
+    // Start 1: pair up the current free fixtures by their distance from the truss centre.
+    // Start 2: the pairs (and centre fixture) spread evenly over the truss.
+    const snap = (v) => Math.round(v * 20) / 20;
+    const currentD = [], evenD = [];
+    for (const plan of plans) {
+      const dist = plan.freeF.map((f) => Math.abs(f.pos[ax] - trussStart(f) - plan.mid)).sort((p, q) => q - p);
+      const count = 2 * plan.pairs + (plan.centre ? 1 : 0);
+      for (let k = 0; k < plan.pairs; k++) {
+        currentD.push(snap(Math.min(plan.mid, (dist[2 * k] + dist[2 * k + 1]) / 2)));
+        evenD.push(snap(plan.mid - ((k + 0.5) * plan.L) / count));
+      }
+      // A lone fixture starts a quarter of the way along, clear of the locked centre fixture.
+      for (let k = 0; k < plan.singles; k++) { currentD.push(snap(plan.L / 4)); evenD.push(snap(plan.L / 4)); }
+    }
+    const fromCurrent = descend(currentD);
+    const fromEven = descend(evenD);
+    const better = (p, q) => p.viol < q.viol - 1e-9 || (Math.abs(p.viol - q.viol) <= 1e-9 && p.best.cost < q.best.cost);
+    const result = better(fromEven, fromCurrent) ? fromEven : fromCurrent;
+    const crowded = plans.filter((plan) => violation(plan, result.d) > 1e-6).map((plan) => plan.ti);
+
+    // Target positions per truss; free fixtures take them in their current order along the truss.
+    const positions = scene.trusses.map((t) => fixturePositions(t).slice());
+    let moved = 0;
+    for (const plan of plans) {
+      const targets = [...plan.fixed];
+      for (const i of plan.varIdx) targets.push(...varPositions(vars[i], result.d[i])); // on the 5 cm grid
+      targets.sort((p, q) => p - q);
+      const order = plan.freeF.slice().sort((f, g) => f.pos[ax] - g.pos[ax]);
+      order.forEach((f, k) => {
+        const v = +targets[k].toFixed(2);
+        if (Math.abs(positions[plan.ti][f.index] - v) > 1e-9) moved++;
+        positions[plan.ti][f.index] = v;
+      });
+    }
+    return {
+      positions,
+      before: { cv: startScore.cv, u0: startScore.u0 },
+      after: { cv: result.best.cv, u0: result.best.u0 },
+      moved,
+      asymmetric,
+      crowded,
+    };
+  }
+
   // Total luminous flux (lm) by integrating the candela table over the sphere — used as a sanity check.
   function integrateFlux(fx) {
     let flux = 0;
@@ -186,7 +418,7 @@
     return flux;
   }
 
-  const api = { intensity, evenPositions, fixturePositions, fixtureLocks, spreadPositions, placeFixtures, illuminanceAt, computeGrid, integrateFlux };
+  const api = { intensity, evenPositions, fixturePositions, fixtureLocks, spreadPositions, optimiseCoverage, placeFixtures, illuminanceAt, computeGrid, integrateFlux };
   if (typeof module !== "undefined") module.exports = api;
   else window.Photometry = api;
 })();

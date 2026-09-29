@@ -28,7 +28,7 @@
   function defaultScene() {
     const s = {
       width: 20, depth: 14,
-      orientation: "x", fixtureDrop: 0.3, heatOpacity: 1, trusses: [],
+      orientation: "x", fixtureDrop: 0.3, heatOpacity: 1, minSpacing: 0.5, trusses: [],
     };
     for (let i = 0; i < 3; i++) s.trusses.push(defaultTruss(s, i, 3));
     return s;
@@ -59,7 +59,7 @@
   // ---------- sidebar ----------
 
   const roomFields = {
-    "room-width": "width", "room-depth": "depth", "fixture-drop": "fixtureDrop",
+    "room-width": "width", "room-depth": "depth", "fixture-drop": "fixtureDrop", "min-spacing": "minSpacing",
   };
 
   function syncRoomInputs() {
@@ -293,6 +293,24 @@
       return;
     }
     applySetup(setup);
+  });
+
+  // Moves unlocked fixtures for the most even light between the trusses, keeping each truss
+  // symmetric about its centre (see optimiseCoverage).
+  $("btn-optimise").addEventListener("click", () => {
+    const out = $("optimise-result");
+    const r = Photometry.optimiseCoverage(scene, LIB);
+    if (!r) { out.textContent = "All fixtures are locked, so there is nothing to move."; return; }
+    scene.trusses.forEach((t, i) => { t.positions = r.positions[i]; });
+    scene.trusses.forEach((_, i) => refreshPositions(i));
+    update();
+    const names = (list) => list.map((i) => `Truss ${i + 1}`).join(", ");
+    let note = "";
+    if (r.asymmetric.length) note += ` · ${names(r.asymmetric)} can't be symmetric because of locked fixtures`;
+    if (r.crowded.length) note += ` · ${names(r.crowded)} too short to keep ${scene.minSpacing} m between fixtures`;
+    out.textContent = (r.moved
+      ? `Min/avg ${r.before.u0.toFixed(2)} → ${r.after.u0.toFixed(2)} · moved ${r.moved} fixture${r.moved === 1 ? "" : "s"}`
+      : `Already as even as it gets (min/avg ${r.after.u0.toFixed(2)})`) + note;
   });
 
   // ---------- calculation ----------

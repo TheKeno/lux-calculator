@@ -39,6 +39,13 @@
           </label>
           <label title="How far the fixtures hang below the truss">Drop <span class="unit">m</span><input type="number" id="fixture-drop" min="0" step="0.05"></label>
         </div>
+        <div class="optimise-row">
+          <button type="button" id="btn-optimise" title="Move unlocked fixtures along their trusses so the light between the trusses is as even as possible, keeping each truss symmetric about its centre. Locked fixtures and dimmers are not changed.">Even out light</button>
+          <label class="spacing" title="Even out light never puts two fixtures on the same truss closer than this">Min spacing
+            <span class="with-unit"><input type="number" id="min-spacing" min="0" step="0.05"><span class="unit">m</span></span>
+          </label>
+        </div>
+        <p class="hint" id="optimise-result"></p>
         <div id="truss-list"></div>
       </section>
 

@@ -133,3 +133,13 @@ input:disabled { opacity: .55; cursor: not-allowed; }
 .truss .lock { width: 24px; }
 .truss .positions-row { margin-top: 6px; }
 .truss .positions { font-size: 11px; }
+
+.optimise-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.optimise-row button { flex: none; }
+
+
+.optimise-row .spacing { display: flex; align-items: center; gap: 6px; font-size: 11px; }
+.optimise-row .with-unit { display: flex; align-items: center; gap: 4px; }
+.optimise-row .spacing input { width: 64px; margin: 0; padding: 3px 6px; font-size: 13px; }
+#optimise-result { margin: 6px 0 0; }
+#optimise-result:empty { display: none; }
