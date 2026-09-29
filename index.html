@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lux Calculator</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Lux Calculator</h1>
+    <div class="topbar-actions">
+      <button type="button" id="btn-defaults" title="Load defaults.json from the project folder">Load defaults</button>
+      <button type="button" id="btn-export">Save setup</button>
+      <label class="button">Load setup<input type="file" id="file-import" accept=".json,application/json" hidden></label>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <section class="panel">
+        <h2>Room</h2>
+        <div class="grid2">
+          <label>Width (X) <span class="unit">m</span><input type="number" id="room-width" min="1" step="0.1"></label>
+          <label>Depth (Y) <span class="unit">m</span><input type="number" id="room-depth" min="1" step="0.1"></label>
+        </div>
+        <p class="area" id="room-area"></p>
+      </section>
+
+      <section class="panel">
+        <h2>Trusses</h2>
+        <div class="grid3">
+          <label>Trusses<input type="number" id="truss-count" min="0" max="50" step="1"></label>
+          <label>Orientation
+            <select id="orientation" title="Direction the trusses run">
+              <option value="x">Along X</option>
+              <option value="y">Along Y</option>
+            </select>
+          </label>
+          <label title="How far the fixtures hang below the truss">Drop <span class="unit">m</span><input type="number" id="fixture-drop" min="0" step="0.05"></label>
+        </div>
+        <div id="truss-list"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Floor plan</h2>
+        <label class="button">Load image…<input type="file" id="file-floorplan" accept="image/*" hidden></label>
+        <button type="button" id="btn-clear-floorplan">Remove</button>
+        <label>Heatmap opacity<input type="range" id="heat-opacity" min="0" max="1" step="0.05"></label>
+        <p class="hint"><code>floorplan.png</code> in the project folder loads automatically. The image is stretched to the room size.</p>
+      </section>
+
+      <section class="panel">
+        <h2>Fixture library</h2>
+        <div id="fixture-library"></div>
+        <p class="hint">Add fixtures: put the PDFs in the project folder and run <code>node tools/extract-fixtures.mjs</code>.</p>
+      </section>
+    </aside>
+
+    <section class="main">
+      <div class="stats" id="stats"></div>
+      <div class="plan-wrap" id="plan-wrap">
+        <canvas id="plan"></canvas>
+        <div class="tooltip" id="tooltip" hidden></div>
+      </div>
+      <p class="hint">Top view, origin at the top-left corner. Each 1 m square shows the illuminance at its centre. Drag a fixture to slide it along its truss, click it to lock it in place, or drag the truss itself to move it. Fixtures point straight down.</p>
+    </section>
+  </main>
+
+  <template id="truss-template">
+    <details class="truss" open>
+      <summary><span class="truss-name"></span><span class="truss-summary"></span><button type="button" class="remove" title="Remove truss">✕</button></summary>
+      <div class="grid3">
+        <label>Height <span class="unit">m</span><input type="number" data-k="height" min="0.5" step="0.1"></label>
+        <label>Length <span class="unit">m</span><input type="number" data-k="length" min="0.5" step="0.1"></label>
+        <label>Fixtures<input type="number" data-k="count" min="0" max="100" step="1"></label>
+        <label>Centre X <span class="unit">m</span><span class="lockable"><input type="number" data-k="cx" step="0.1"><button type="button" class="lock" data-lock="lockX" aria-pressed="false" title="Lock X position"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5" fill="currentColor"/><path class="shackle" d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></button></span></label>
+        <label>Centre Y <span class="unit">m</span><span class="lockable"><input type="number" data-k="cy" step="0.1"><button type="button" class="lock" data-lock="lockY" aria-pressed="false" title="Lock Y position"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5" fill="currentColor"/><path class="shackle" d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></button></span></label>
+        <label>Dimmer <span class="unit">%</span><input type="number" data-k="dimmer" min="0" max="100" step="5"></label>
+        <label class="span3">Fixture type<select data-k="fixtureId"></select></label>
+      </div>
+      <div class="positions-row">
+        <span class="positions"></span>
+        <button type="button" class="spread">Spread evenly</button>
+      </div>
+    </details>
+  </template>
+
+  <script src="fixtures.js"></script>
+  <script src="defaults.js"></script>
+  <script src="photometry.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
