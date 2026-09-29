@@ -16,9 +16,9 @@ window.DEFAULT_SETUP = {
       "fixtureId": "XFL300TW-3500K",
       "positions": [
         0,
-        3.8,
+        3,
         15,
-        11.2,
+        12,
         7.5
       ],
       "lockX": true,
@@ -42,8 +42,8 @@ window.DEFAULT_SETUP = {
       "positions": [
         0,
         15,
-        2.45,
-        12.55
+        4.7,
+        10.3
       ],
       "lockX": true,
       "lockY": true,
